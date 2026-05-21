@@ -1,0 +1,13 @@
+# Pearl wallet binaries (download from releases)
+pearld
+oyster
+prlctl
+
+# Claude Code session data
+.claude/
+
+# Temp/cache files
+/tmp/
+
+# macOS
+.DS_Store

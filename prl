@@ -1,0 +1,328 @@
+#!/bin/bash
+# prl — Pearl wallet wrapper
+# Auto-manages pearld + oyster daemons; wraps common wallet operations.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PEARLD="$SCRIPT_DIR/pearld"
+OYSTER="$SCRIPT_DIR/oyster"
+PRLCTL="$SCRIPT_DIR/prlctl"
+CONF="$HOME/.pearl_wallet.conf"
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+RPC_USER="" RPC_PASS="" WALLET_PASS=""
+if [[ -f "$CONF" ]]; then source "$CONF"; fi
+
+# ── internal helpers ──────────────────────────────────────────────────────────
+
+die() { echo "error: $*" >&2; exit 1; }
+
+node_rpc() {
+    "$PRLCTL" -u "$RPC_USER" -P "$RPC_PASS" "$@"
+}
+
+wallet_rpc() {
+    # oyster issues its own TLS cert at ~/.oyster/rpc.cert, separate from pearld's
+    "$PRLCTL" --wallet -u "$RPC_USER" -P "$RPC_PASS" \
+        -c "$HOME/.oyster/rpc.cert" "$@"
+}
+
+pearld_alive() { node_rpc getblockcount &>/dev/null; }
+oyster_alive()  { wallet_rpc getbalance &>/dev/null; }
+
+start_pearld() {
+    pearld_alive && return 0
+    echo -n "Starting pearld..."
+    nohup "$PEARLD" >> "$HOME/.pearld/pearld.log" 2>&1 &
+    for i in $(seq 1 30); do
+        sleep 2
+        if pearld_alive; then echo " ok"; return 0; fi
+        echo -n "."
+    done
+    echo " timeout — check $HOME/.pearld/pearld.log" >&2; return 1
+}
+
+start_oyster() {
+    oyster_alive && return 0
+    echo -n "Starting oyster..."
+    nohup "$OYSTER" >> "$HOME/.oyster/oyster.log" 2>&1 &
+    for i in $(seq 1 30); do
+        sleep 2
+        if oyster_alive; then echo " ok"; return 0; fi
+        echo -n "."
+    done
+    echo " timeout — check $HOME/.oyster/oyster.log" >&2; return 1
+}
+
+ensure_running() {
+    [[ -n "$RPC_USER" && -n "$RPC_PASS" ]] || die "not configured — run: prl setup"
+    start_pearld
+    start_oyster
+}
+
+unlock() {
+    local pass="${WALLET_PASS:-}"
+    if [[ -z "$pass" ]]; then
+        read -rsp "Wallet passphrase: " pass; echo >&2
+    fi
+    wallet_rpc walletpassphrase "$pass" 30 &>/dev/null
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+do_setup() {
+    local def_user="${RPC_USER:-pearl}"
+    local def_pass="${RPC_PASS:-$(head -c 18 /dev/urandom | base64 | tr -d '+/=')}"
+    local user pass wpass
+
+    echo "Pearl wallet setup — credentials saved to $CONF (mode 600)"
+    echo
+    read -rp  "RPC username [$def_user]: " user; user="${user:-$def_user}"
+    read -rsp "RPC password: " pass; echo
+    [[ -z "$pass" ]] && pass="$def_pass"
+    echo "Wallet spending passphrase — stored here for auto-unlock on send."
+    echo "Leave blank to be prompted each time instead."
+    read -rsp "Wallet passphrase (optional): " wpass; echo
+
+    RPC_USER="$user" RPC_PASS="$pass" WALLET_PASS="$wpass"
+    cat > "$CONF" <<EOF
+RPC_USER="$RPC_USER"
+RPC_PASS="$RPC_PASS"
+WALLET_PASS="$WALLET_PASS"
+EOF
+    chmod 600 "$CONF"
+
+    mkdir -p "$HOME/.pearld" "$HOME/.oyster"
+    printf 'rpcuser=%s\nrpcpass=%s\n' "$RPC_USER" "$RPC_PASS" > "$HOME/.pearld/pearld.conf"
+    printf 'username=%s\npassword=%s\n' "$RPC_USER" "$RPC_PASS" > "$HOME/.oyster/oyster.conf"
+    chmod 600 "$HOME/.pearld/pearld.conf" "$HOME/.oyster/oyster.conf"
+
+    echo
+    echo "Done. First-time wallet creation:"
+    echo "  1. prl start-node   — start pearld and wait for it to be ready"
+    echo "  2. prl create       — create your wallet (interactive prompts)"
+    echo "  3. prl start        — start oyster wallet daemon"
+    echo "  4. prl balance      — verify everything is working"
+}
+
+do_create() {
+    [[ -n "$RPC_USER" && -n "$RPC_PASS" ]] || die "not configured — run: prl setup"
+    start_pearld
+    # --create is interactive: prompts for public/private passphrase and shows seed words
+    exec "$OYSTER" --create
+}
+
+do_import() {
+    [[ -n "$RPC_USER" && -n "$RPC_PASS" ]] || die "not configured — run: prl setup"
+    start_pearld
+
+    echo "Restore wallet from seed"
+    echo "Seed should be hex-encoded (64 hex chars). If you have a word list, convert it first."
+    echo
+
+    local seed priv_pass pub_pass bday
+    read -rsp "Private passphrase (spending password for restored wallet): " priv_pass; echo
+    [[ -z "$priv_pass" ]] && die "private passphrase is required"
+    read -rsp "Public passphrase (optional, leave blank to skip): " pub_pass; echo
+    read -rp  "Hex seed: " seed
+    [[ -z "$seed" ]] && die "seed is required"
+    read -rp  "Wallet birthday as unix timestamp (optional, speeds up rescan — leave blank to scan from genesis): " bday
+
+    local walletdb="$HOME/.oyster/mainnet/wallet.db"
+    if [[ -f "$walletdb" ]]; then
+        local backup="${walletdb}.bak.$(date +%Y%m%d-%H%M%S)"
+        echo "Existing wallet found — backing up to $backup"
+        mv "$walletdb" "$backup"
+    fi
+
+    local tmpfile
+    tmpfile="$(mktemp /tmp/pearl_restore_XXXXXX.json)"
+
+    python3 -c "
+import json, sys
+d = {'PrivatePassphrase': sys.argv[1], 'Seed': sys.argv[2]}
+if sys.argv[3]: d['PublicPassphrase'] = sys.argv[3]
+if sys.argv[4]: d['Bday'] = sys.argv[4]
+print(json.dumps(d))
+" "$priv_pass" "$seed" "$pub_pass" "$bday" > "$tmpfile"
+    chmod 600 "$tmpfile"
+
+    "$OYSTER" --createfromfile="$tmpfile"
+    rm -f "$tmpfile"
+}
+
+do_export() {
+    local outfile="${1:-$HOME/pearl-wallet-export-$(date +%Y%m%d-%H%M%S).txt}"
+    ensure_running
+    unlock
+    wallet_rpc dumpwallet "$outfile"
+    chmod 600 "$outfile"
+    echo "Exported to: $outfile"
+}
+
+do_start_node() {
+    [[ -n "$RPC_USER" && -n "$RPC_PASS" ]] || die "not configured — run: prl setup"
+    start_pearld
+}
+
+do_start() { ensure_running; }
+
+do_stop() {
+    if node_rpc stop &>/dev/null; then echo "pearld: stopping gracefully"; fi
+    if pkill -f "$(basename "$OYSTER")" 2>/dev/null; then echo "oyster: stopped"; fi
+}
+
+do_balance() {
+    ensure_running
+    wallet_rpc getbalance
+}
+
+do_receive() {
+    ensure_running
+    wallet_rpc getnewaddress
+}
+
+do_send() {
+    local addr="${1?Usage: prl send <address> <amount> [feerate_prl_per_kb]}"
+    local amount="${2?Usage: prl send <address> <amount> [feerate_prl_per_kb]}"
+    local feerate="${3:-0.0001}"
+    ensure_running
+    unlock
+    wallet_rpc sendtoaddress "$addr" "$amount" "$feerate"
+}
+
+do_txs() {
+    local count="${1:-10}"
+    ensure_running
+    wallet_rpc listtransactions "*" "$count" 0
+}
+
+do_tx() {
+    local txid="${1?Usage: prl tx <txid>}"
+    ensure_running
+    wallet_rpc gettransaction "$txid"
+}
+
+do_sync() {
+    ensure_running
+    node_rpc getblockchaininfo
+}
+
+do_info() {
+    ensure_running
+    wallet_rpc listaccounts
+}
+
+do_consolidate() {
+    local target="${1:-}"
+    ensure_running
+
+    local utxos
+    utxos=$(wallet_rpc listunspent)
+
+    local total addr_count
+    total=$(echo "$utxos" | python3 -c "
+import json,sys
+us=json.load(sys.stdin)
+addrs=set(u['address'] for u in us)
+print(f'{sum(float(u[\"amount\"]) for u in us):.8f}')
+print(len(addrs))
+")
+    local prl_total addr_count
+    prl_total=$(echo "$total" | head -1)
+    addr_count=$(echo "$total" | tail -1)
+
+    if [[ -z "$target" ]]; then
+        # default to address with most PRL
+        target=$(echo "$utxos" | python3 -c "
+import json,sys
+from collections import defaultdict
+us=json.load(sys.stdin)
+bal=defaultdict(float)
+for u in us: bal[u['address']]+=float(u['amount'])
+print(max(bal, key=bal.get))
+")
+        echo "Target address (highest balance): $target"
+    fi
+
+    local send_amount
+    send_amount=$(python3 -c "print(f'{float(\"$prl_total\") - 0.1:.8f}')")
+
+    echo "Total balance : $prl_total PRL across $addr_count addresses"
+    echo "Sweep amount  : $send_amount PRL (leaving 0.1 for fees)"
+    echo "Destination   : $target"
+    echo
+    read -rp "Confirm consolidation? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
+
+    unlock
+    wallet_rpc sendtoaddress "$target" "$send_amount" 0.0001
+    echo "Done. Wait for confirmation then run: prl balance"
+}
+
+# Escape hatch: run any prlctl command directly
+do_cmd() {
+    [[ -n "$RPC_USER" && -n "$RPC_PASS" ]] || die "not configured — run: prl setup"
+    local target="${1:-wallet}"; shift
+    if [[ "$target" == "node" ]]; then
+        node_rpc "$@"
+    else
+        wallet_rpc "$@"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Usage: prl <command> [args]
+
+Setup (first time):
+  setup                         Configure RPC credentials and daemon configs
+  start-node                    Start pearld node daemon
+  create                        Create a new wallet interactively (one-time)
+  import                        Restore wallet from hex seed
+  start                         Start oyster wallet daemon
+
+Daily use:
+  balance                       Show wallet balance
+  receive                       Get a new receive address
+  send <addr> <amt> [feerate]   Send PRL  (feerate = PRL/kb, default 0.0001)
+  txs [n]                       Last N transactions (default 10)
+  tx <txid>                     Transaction details
+
+Info:
+  export [file]                 Export all private keys to file (wallet backup)
+  consolidate [addr]            Sweep all UTXOs into one address (default: largest)
+  sync                          Blockchain sync progress
+  info                          Wallet daemon info
+  stop                          Gracefully stop all daemons
+
+Advanced:
+  cmd [wallet|node] <rpc...>    Run any prlctl RPC command directly
+                                e.g. prl cmd wallet listunspent
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"; shift 2>/dev/null || true
+case "$CMD" in
+    setup)       do_setup ;;
+    create)      do_create ;;
+    import)      do_import ;;
+    start-node)  do_start_node ;;
+    start)       do_start ;;
+    stop)        do_stop ;;
+    balance)     do_balance ;;
+    receive)     do_receive ;;
+    send)        do_send "$@" ;;
+    txs)         do_txs "$@" ;;
+    tx)          do_tx "$@" ;;
+    export)      do_export "$@" ;;
+    consolidate) do_consolidate "$@" ;;
+    sync)        do_sync ;;
+    info)        do_info ;;
+    cmd)         do_cmd "$@" ;;
+    help|--help|-h) usage ;;
+    *) echo "Unknown command: $CMD"; echo; usage; exit 1 ;;
+esac
