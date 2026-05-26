@@ -12,3 +12,4 @@ prlctl
 # macOS
 .DS_Store
 CLAUDE.md
+.env
